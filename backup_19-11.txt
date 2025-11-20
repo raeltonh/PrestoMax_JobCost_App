@@ -1,0 +1,2299 @@
+# -*- coding: utf-8 -*-
+"""
+Presto MAX — Job Cost Calculator
+Streamlit application to estimate the production cost for a specific job
+(roll) on the Presto MAX printer.
+
+Main features:
+
+* Import ink consumption from the machine's XML (inside a ZIP) or manually
+  input values (ml/m²), or from a ControlCenter PDF report.
+* Define job dimensions (usable width, length, waste %) and compute area and
+  total length including waste.
+* Select print mode (speed in m²/h) and estimate print time.
+* Convert monthly salaries for several roles into hourly cost and job cost.
+* Include extra services (laser cutting, internal sewing).
+* Include energy and machine depreciation (machine value, useful life, hours/month).
+* Produce a full cost breakdown (ink, fabric, other variables, labour,
+  energy, depreciation) and cost per m² and per linear metre.
+* Suggest selling prices based on target margin, with multiple scenarios.
+* Let the user input a selling price per m or per m² and show the real margin.
+* Show charts comparing cost vs selling price vs profit per unit.
+* Show operation efficiency (theoretical vs actual time) and productivity vs efficiency.
+* Professional layout using tabs and subtle charts.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import re
+import zipfile
+import tempfile
+import xml.etree.ElementTree as ET
+from typing import Dict, Tuple, List, Any
+
+import numpy as np  # type: ignore
+import pandas as pd  # type: ignore
+import streamlit as st
+import matplotlib.pyplot as plt  # type: ignore
+
+# Optional PDF support
+try:
+    from fpdf import FPDF  # type: ignore
+except Exception:  # pragma: no cover
+    FPDF = None  # type: ignore
+
+# Optional ControlCenter PDF reader
+try:
+    from PyPDF2 import PdfReader  # type: ignore
+except Exception:  # pragma: no cover
+    PdfReader = None  # type: ignore
+
+# -------------------------------------------------------------------------
+# Visual settings
+# -------------------------------------------------------------------------
+
+PALETTE_MAIN = [
+    "#4F75C2",  # muted blue
+    "#7A97D4",  # soft blue
+    "#A3B7E6",  # very soft blue
+    "#6B7280",  # muted grey
+    "#CBD5F5",  # very light blue
+]
+PALETTE_SECONDARY = [
+    "#10B981",  # soft green
+    "#F59E0B",  # soft amber
+]
+
+plt.rcParams.update(
+    {
+        "axes.edgecolor": "#E5E7EB",
+        "axes.grid": True,
+        "grid.color": "#E5E7EB",
+        "grid.linestyle": "--",
+        "grid.linewidth": 0.7,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.spines.left": False,
+        "axes.spines.bottom": False,
+        "figure.figsize": (5.5, 3.4),
+        "axes.titlesize": 11,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+    }
+)
+
+# -------------------------------------------------------------------------
+# Constants
+# -------------------------------------------------------------------------
+
+PRINT_MODES: Dict[str, Dict[str, object]] = {
+    "Fast Quality":         {"speed": 270.0, "res_color": "800×400"},
+    "Fast Production":      {"speed": 475.0, "res_color": "800×400"},
+    "Standard Quality":     {"speed": 180.0, "res_color": "600×800"},
+    "Standard Production":  {"speed": 278.0, "res_color": "600×800"},
+    "Saturation Quality":   {"speed": 115.0, "res_color": "1000×800"},
+    "Saturation Production":{"speed": 210.0, "res_color": "1000×800"},
+}
+
+CHANNELS_WHITE = {"white", "w"}
+CHANNELS_FOF = {
+    "fof", "f", "fix", "fixation", "pretreat", "pre_treat",
+    "duosoft", "softener", "fixacao", "fixacaofof"
+}
+
+# -------------------------------------------------------------------------
+# XML helpers
+# -------------------------------------------------------------------------
+
+def parse_presto_xml(xml_bytes: bytes) -> Tuple[float, Dict[str, float]]:
+    """Parse XML from Presto MAX and return (area_m2, {sep: ml_total})."""
+    root = ET.fromstring(xml_bytes)
+
+    def _to_float(x: str) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    width_cm = _to_float(root.findtext("Width", "0"))
+    height_cm = _to_float(root.findtext("Height", "0"))
+    area_m2 = (width_cm / 100.0) * (height_cm / 100.0)
+
+    ml_node = root.find("NumberOfMlPerSeparation")
+    if ml_node is None:
+        ml_node = root.find("NumberOfMlPerSeperation")
+
+    ml_per_sep: Dict[str, float] = {}
+    if ml_node is not None:
+        for child in ml_node:
+            try:
+                ml_per_sep[child.tag] = float(child.text or "0")
+            except Exception:
+                ml_per_sep[child.tag] = 0.0
+
+    return area_m2, ml_per_sep
+
+
+def normalize_sep_name(name: str) -> str:
+    """Normalise separation names to friendly labels."""
+    n = (name or "").strip()
+    lower = n.lower()
+    if lower.startswith("whi"):
+        return "White"
+    if lower.startswith(("fof", "fix", "pretreat", "pre_treat")):
+        return "FOF"
+    return n
+
+
+def ml_per_m2_from_xml_bytes(xml_bytes: bytes) -> Dict[str, float]:
+    """Return ml/m² per separation from XML bytes."""
+    area, ml_sep = parse_presto_xml(xml_bytes)
+    out: Dict[str, float] = {}
+    if area > 0:
+        for sep, ml_total in ml_sep.items():
+            out[normalize_sep_name(sep)] = ml_total / area
+    return out
+
+
+def pick_xml_from_zip(zbytes: bytes) -> Tuple[str | None, bytes | None]:
+    """Return (xml_name, xml_bytes) for first XML in ZIP or (None, None)."""
+    with zipfile.ZipFile(io.BytesIO(zbytes)) as z:
+        xml_files = [n for n in z.namelist() if n.lower().endswith(".xml")]
+        if not xml_files:
+            return None, None
+        first = xml_files[0]
+        return first, z.read(first)
+
+
+# -------------------------------------------------------------------------
+# ControlCenter PDF report parsing
+# -------------------------------------------------------------------------
+
+def _to_float_locale(value: str) -> float:
+    """Convert a string with . or , as decimal separator to float."""
+    if value is None:
+        return 0.0
+    s = (
+        str(value)
+        .strip()
+        .replace(" ", "")
+        .replace("\u00a0", "")  # remove non-breaking spaces
+    )
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def parse_controlcenter_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
+    """
+    Parse a ControlCenter job report PDF and return a dict with:
+    - width_m: job width in metres
+    - length_m: job length in metres
+    - job_name: file / job name (if found)
+    - ml_map_m2: dict channel -> ml/m² (Fixation mapped separately)
+    - raw_text: concatenated text extracted from the first pages
+    """
+    if PdfReader is None:
+        raise RuntimeError(
+            "PyPDF2 is not available. Install it with 'pip install PyPDF2'."
+        )
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text_parts: List[str] = []
+    for page in reader.pages[:2]:
+        page_text = page.extract_text() or ""
+        text_parts.append(page_text)
+    text = "\n".join(text_parts)
+
+    # Job name (Spanish examples)
+    job_name = ""
+    m_name = re.search(
+        r"Nombre\s+del\s+archivo\s+(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_name:
+        job_name = m_name.group(1).strip()
+
+    # Size, examples:
+    # 'Tamaño 1.74 m x 0.20 m'  or  'Tamano 1.74 m x 0.20 m'
+    width_m = 0.0
+    length_m = 0.0
+    m_size = re.search(
+        r"(Tama\u00f1o|Tamano)\s+([\d\.,]+)\s*m\s*x\s*([\d\.,]+)\s*m",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_size:
+        width_m = _to_float_locale(m_size.group(2))
+        length_m = _to_float_locale(m_size.group(3))
+
+    # Ink table line – ml/m² row
+    ml_map_m2: Dict[str, float] = {}
+
+    pattern_ml = r"ml\s*/\s*m[²2]?\s+((?:[\d.,]+\s+){3,}[\d.,]+)"
+    ml_line_numbers: List[str] = []
+
+    m_ml = re.search(pattern_ml, text, flags=re.IGNORECASE)
+    if m_ml:
+        ml_line_numbers = re.findall(r"[\d.,]+", m_ml.group(1))
+
+    if not ml_line_numbers:
+        candidate_line = ""
+        for line in text.splitlines():
+            if "ml/m" in line.lower():
+                nums_in_line = re.findall(r"[\d.,]+", line)
+                if len(nums_in_line) >= 4:
+                    candidate_line = line
+                    ml_line_numbers = nums_in_line
+                    break
+
+    if ml_line_numbers:
+        values = [_to_float_locale(n) for n in ml_line_numbers]
+
+        channels_order = [
+            "Cyan",
+            "Magenta",
+            "Yellow",
+            "Black",
+            "Red",
+            "Green",
+            "Fixation",
+            "Total",
+        ]
+
+        for ch, val in zip(channels_order, values):
+            if ch == "Total":
+                continue
+            ml_map_m2[ch] = val
+
+    return {
+        "width_m": width_m,
+        "length_m": length_m,
+        "job_name": job_name,
+        "ml_map_m2": ml_map_m2,
+        "raw_text": text,
+    }
+
+
+# -------------------------------------------------------------------------
+# Core job simulation
+# -------------------------------------------------------------------------
+
+def simulate_job(
+    width_m: float,
+    length_m: float,
+    waste_pct: float,
+    speed_m2h: float,
+    ml_map_m2: Dict[str, float],
+    ink_color_per_l: float,
+    ink_white_per_l: float,
+    fof_per_l: float,
+    fabric_cost_per_m2: float,
+    others_var_per_m2: float,
+    labour_cost_total: float,
+) -> Dict[str, float]:
+    """Compute area, time and cost metrics for a single job."""
+    width_m = max(0.0, width_m)
+    length_m = max(0.0, length_m)
+    waste_pct = max(0.0, waste_pct)
+
+    base_area_m2 = width_m * length_m
+    length_with_waste = length_m * (1.0 + waste_pct / 100.0)
+    area_with_waste = base_area_m2 * (1.0 + waste_pct / 100.0)
+
+    speed_m2h = max(0.0, speed_m2h)
+    time_print_h = (base_area_m2 / speed_m2h) if speed_m2h > 0 else 0.0
+
+    color_ml = 0.0
+    white_ml = 0.0
+    fof_ml = 0.0
+    for k, v in (ml_map_m2 or {}).items():
+        key_lower = (k or "").strip().lower()
+        v_float = float(v or 0.0)
+        if key_lower in CHANNELS_WHITE:
+            white_ml += v_float
+        elif key_lower in CHANNELS_FOF:
+            fof_ml += v_float
+        else:
+            color_ml += v_float
+
+    total_ml_per_m2 = color_ml + white_ml + fof_ml
+    ink_ml_total = total_ml_per_m2 * area_with_waste
+
+    cost_ink = (
+        (color_ml / 1000.0) * ink_color_per_l +
+        (white_ml / 1000.0) * ink_white_per_l +
+        (fof_ml   / 1000.0) * fof_per_l
+    ) * area_with_waste
+
+    cost_media = fabric_cost_per_m2 * area_with_waste
+    cost_other = others_var_per_m2 * area_with_waste
+    cost_labour = labour_cost_total
+
+    total_cost = cost_ink + cost_media + cost_other + cost_labour
+
+    cost_per_m2 = total_cost / area_with_waste if area_with_waste > 0 else 0.0
+    cost_per_m = total_cost / length_with_waste if length_with_waste > 0 else 0.0
+
+    return dict(
+        width_m=width_m,
+        length_m=length_m,
+        waste_pct=waste_pct,
+        base_area_m2=base_area_m2,
+        area_with_waste=area_with_waste,
+        length_with_waste=length_with_waste,
+        time_print_h=time_print_h,
+        color_ml_per_m2=color_ml,
+        white_ml_per_m2=white_ml,
+        fof_ml_per_m2=fof_ml,
+        total_ml_per_m2=total_ml_per_m2,
+        ink_ml_total=ink_ml_total,
+        cost_ink=cost_ink,
+        cost_media=cost_media,
+        cost_other=cost_other,
+        cost_labour=cost_labour,
+        total_cost=total_cost,
+        cost_per_m2=cost_per_m2,
+        cost_per_m=cost_per_m,
+    )
+
+
+def compute_full_job(
+    width_m: float,
+    length_m: float,
+    waste_pct: float,
+    speed_m2h: float,
+    ml_map_m2: Dict[str, float],
+    ink_color_per_l: float,
+    ink_white_per_l: float,
+    fof_per_l: float,
+    fabric_cost_per_m2: float,
+    other_var_simple_per_m2: float,
+    laser_people: float,
+    laser_hours_job: float,
+    laser_salary_month: float,
+    laser_energy_cost_per_hour: float,
+    laser_machine_value: float,
+    laser_useful_life_years: float,
+    laser_hours_per_month: float,
+    sewing_cost_per_m: float,
+    hours_month: float,
+    labour_inputs: List[tuple],
+    energy_cost_per_hour: float,
+    machine_value: float,
+    useful_life_years: float,
+    machine_hours_per_month: float,
+    post_h: float,
+) -> Dict[str, Any]:
+    """
+    Run the whole calculation pipeline and return a dict with all metrics.
+    Used once and stored in st.session_state["calc"].
+    """
+    base_area_m2 = width_m * length_m
+    area_with_waste = base_area_m2 * (1.0 + waste_pct / 100.0)
+    length_with_waste = length_m * (1.0 + waste_pct / 100.0)
+
+    # ---------------------- SERVICES (LASER, SEWING, OTHERS) ----------------------
+
+    # Laser cutting – detailed cost (labour + energy + depreciation)
+    if laser_people > 0 and laser_hours_job > 0 and hours_month > 0 and laser_salary_month > 0:
+        laser_cost_per_hour_per_person = laser_salary_month / float(hours_month)
+        laser_labour_cost = laser_cost_per_hour_per_person * laser_hours_job * laser_people
+    else:
+        laser_labour_cost = 0.0
+
+    if laser_hours_job > 0 and laser_energy_cost_per_hour > 0:
+        laser_energy_cost = laser_energy_cost_per_hour * laser_hours_job
+    else:
+        laser_energy_cost = 0.0
+
+    if laser_machine_value > 0 and laser_useful_life_years > 0 and laser_hours_per_month > 0:
+        laser_monthly_depreciation = laser_machine_value / (laser_useful_life_years * 12.0)
+        laser_depreciation_per_hour = laser_monthly_depreciation / laser_hours_per_month
+        laser_depreciation_cost = laser_depreciation_per_hour * laser_hours_job
+    else:
+        laser_monthly_depreciation = 0.0
+        laser_depreciation_per_hour = 0.0
+        laser_depreciation_cost = 0.0
+
+    laser_total = laser_labour_cost + laser_energy_cost + laser_depreciation_cost
+
+    sewing_total = sewing_cost_per_m * length_with_waste
+    others_simple_total = other_var_simple_per_m2 * area_with_waste
+
+    others_total = laser_total + sewing_total + others_simple_total
+    others_var_per_m2 = (others_total / area_with_waste) if area_with_waste > 0 else 0.0
+
+    # ---------------------- LABOUR (PRESTO + OTHER ROLES) ----------------------
+
+    labour_cost_total = 0.0
+    labour_breakdown = []
+    filtered_labour_inputs = []
+    for label, salary, hours_job, qty in labour_inputs:
+        if salary > 0 and hours_job > 0 and hours_month > 0 and qty > 0:
+            cost_per_h = salary / float(hours_month)
+            cost_job_per_person = cost_per_h * hours_job
+            cost_job_total = cost_job_per_person * qty
+            labour_cost_total += cost_job_total
+            labour_breakdown.append(
+                (label, cost_per_h, hours_job, qty, cost_job_per_person, cost_job_total)
+            )
+            filtered_labour_inputs.append((label, salary, hours_job, qty))
+
+    # ---------------------- CORE JOB (INK, FABRIC, ETC.) ----------------------
+
+    res = simulate_job(
+        width_m=width_m,
+        length_m=length_m,
+        waste_pct=waste_pct,
+        speed_m2h=speed_m2h,
+        ml_map_m2=ml_map_m2,
+        ink_color_per_l=ink_color_per_l,
+        ink_white_per_l=ink_white_per_l,
+        fof_per_l=fof_per_l,
+        fabric_cost_per_m2=fabric_cost_per_m2,
+        others_var_per_m2=others_var_per_m2,
+        labour_cost_total=labour_cost_total,
+    )
+
+    # ---------------------- DEPRECIATION (PRESTO MAX) ----------------------
+
+    if machine_value > 0 and useful_life_years > 0 and machine_hours_per_month > 0:
+        monthly_depreciation = machine_value / (useful_life_years * 12.0)
+        depreciation_cost_per_hour = monthly_depreciation / machine_hours_per_month
+    else:
+        monthly_depreciation = 0.0
+        depreciation_cost_per_hour = 0.0
+
+    # Machine running time (Presto only)
+    # Theoretical: print time + extra post-process time
+    machine_time_h = res["time_print_h"] + max(post_h, 0.0)
+
+    # If "Machine operator" has hours in this job, we use that as actual machine time
+    operator_time_h = 0.0
+    for label, _salary, hours_job, _qty in labour_inputs:
+        if label.lower().startswith("machine operator"):
+            operator_time_h = max(float(hours_job), 0.0)
+            break
+
+    if operator_time_h > 0:
+        machine_time_h = operator_time_h
+
+    # Energy + depreciation for the Presto (laser treated separately)
+    time_total_h = machine_time_h
+    cost_energy = energy_cost_per_hour * time_total_h
+    cost_depreciation = depreciation_cost_per_hour * time_total_h
+
+    total_cost_with_energy = res["total_cost"] + cost_energy + cost_depreciation
+    cost_per_m2_with_energy = (
+        total_cost_with_energy / res["area_with_waste"]
+        if res["area_with_waste"] > 0 else 0.0
+    )
+    cost_per_m_with_energy = (
+        total_cost_with_energy / res["length_with_waste"]
+        if res["length_with_waste"] > 0 else 0.0
+    )
+
+    return dict(
+        res=res,
+        laser_total=laser_total,
+        sewing_total=sewing_total,
+        others_simple_total=others_simple_total,
+        laser_labour=laser_labour_cost,
+        laser_energy=laser_energy_cost,
+        laser_monthly_depreciation=laser_monthly_depreciation,
+        laser_depreciation_per_hour=laser_depreciation_per_hour,
+        laser_depreciation_cost=laser_depreciation_cost,
+        labour_breakdown=labour_breakdown,
+        filtered_labour_inputs=filtered_labour_inputs,
+        monthly_depreciation=monthly_depreciation,
+        depreciation_per_hour=depreciation_cost_per_hour,
+        time_total_h=time_total_h,
+        cost_energy=cost_energy,
+        cost_depreciation=cost_depreciation,
+        total_cost_with_energy=total_cost_with_energy,
+        cost_per_m2_with_energy=cost_per_m2_with_energy,
+        cost_per_m_with_energy=cost_per_m_with_energy,
+        ml_map_m2=ml_map_m2,
+    )
+
+
+def bottom_nav() -> None:
+    """Render a small link at the bottom to scroll back to the top tabs."""
+    st.markdown(
+        """
+        <div style="text-align:right; margin-top: 1.5rem;">
+          <a href="#top-tabs"
+            style="
+              display:inline-block;
+              padding:0.35rem 0.9rem;
+              border-radius:999px;
+              border:1px solid #e5e7eb;
+              background:#f9fafb;
+              cursor:pointer;
+              font-size:0.85rem;
+              text-decoration:none;
+              color:#111827;
+            ">
+            ⬆ Back to top tabs
+          </a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# -------------------------------------------------------------------------
+# Streamlit app
+# -------------------------------------------------------------------------
+
+def currency_label() -> str:
+    return st.session_state.get("currency_label", "$")
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Presto MAX — Job Cost Calculator",
+        page_icon="🧵",
+        layout="wide",
+    )
+    st.markdown('<div id="top-tabs"></div>', unsafe_allow_html=True)
+
+    # CSS
+    st.markdown(
+        """
+        <style>
+        :root{
+          --ink-bg: #f6f8fc;
+          --ink-panel: #f3f4f6;
+          --ink-edge: #e6e9f1;
+          --ink-text: #111827;
+          --ink-muted: #6b7280;
+          --ink-chip: #eef2f7;
+          --ink-accent: #2563eb;
+          --ink-white: #ffffff;
+          --ink-shadow: 0 1px 2px rgba(16,24,40,.08), 0 4px 12px rgba(16,24,40,.06);
+        }
+
+        html, body, [data-testid="stAppViewContainer"], .block-container{
+          background:var(--ink-bg) !important;
+          color:var(--ink-text) !important;
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+        }
+
+        h1,h2,h3,h4,h5,h6,
+        p, small, label, span, div,
+        .stMarkdown, [data-testid="stMarkdownContainer"] *{
+          color:var(--ink-text) !important;
+        }
+
+        [data-testid="stCaptionContainer"] *{ color:var(--ink-muted) !important; }
+
+        [data-testid="stMetric"]{
+          background:var(--ink-panel);
+          border:1px solid var(--ink-edge);
+          border-radius:14px; padding:12px;
+          box-shadow: var(--ink-shadow);
+          min-height: 88px;
+          min-width: 170px;
+        }
+        [data-testid="stMetricValue"], [data-testid="stMetricValue"] *{
+          font-variant-numeric: tabular-nums !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---- Company header: Logitex logo + title ----
+    header_col1, header_col2 = st.columns([1, 3])
+    with header_col1:
+        try:
+            st.image("logitex.png", width=150)
+        except Exception:
+            st.write("")
+    with header_col2:
+        st.title("Presto MAX — Job Cost Calculator")
+        st.caption(
+            "Job cost calculator for a specific order (roll) on the Presto MAX printer."
+        )
+
+    # Global reset button – clears all inputs and calculations
+    if st.button("🔄 Reset all data", type="secondary", key="btn_reset_all"):
+        st.session_state.clear()
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:  # fallback for older versions
+            st.experimental_rerun()
+
+    if "calc" not in st.session_state:
+        st.session_state["calc"] = None
+
+    tab_job, tab_conf, tab_ink, tab_results, tab_price, tab_laser_price, tab_compare, tab_break = st.tabs(
+        [
+            "Job & print mode",
+            "Configuration",
+            "Ink consumption",
+            "Cost results",
+            "Selling price",
+            "Laser service pricing",
+            "Comparison",
+            "Breakdown",
+        ]
+    )
+
+    # ------------------------- TAB: CONFIGURATION -------------------------
+    with tab_conf:
+        st.header("0. General settings & costs")
+
+        col_curr, col_source = st.columns([1, 2])
+        col_curr.text_input(
+            "Currency symbol (e.g. $, €)",
+            value=st.session_state.get("currency_label", "$"),
+            key="currency_label",
+        )
+        consumption_source = col_source.radio(
+            "Ink consumption source",
+            ["Machine XML inside ZIP", "Manual (ml/m²)", "ControlCenter PDF report"],
+            index=0,
+            horizontal=True,
+        )
+        col_source.caption("👉 Upload the XML, manual data or ControlCenter PDF in the **Ink consumption** tab.")
+
+        st.markdown("---")
+        st.subheader("Ink costs (per litre, by channel group)")
+        col_ink1, col_ink2, col_ink3 = st.columns(3)
+        ink_color_per_l = col_ink1.number_input(
+            f"Coloured ink ({currency_label()}/L)",
+            min_value=0.0,
+            value=200.0,
+        )
+        ink_white_per_l = col_ink2.number_input(
+            f"White ink ({currency_label()}/L)",
+            min_value=0.0,
+            value=0.0,
+        )
+        fof_per_l = col_ink3.number_input(
+            f"FOF / pretreatment ({currency_label()}/L)",
+            min_value=0.0,
+            value=50.0,
+        )
+
+        st.markdown("---")
+        st.subheader("Fabric and variable costs")
+        col_fab1, col_fab2 = st.columns(2)
+        fabric_cost_per_m2 = col_fab1.number_input(
+            f"Fabric/media ({currency_label()}/m²)",
+            min_value=0.0,
+            value=3.0,
+        )
+        other_var_simple_per_m2 = col_fab2.number_input(
+            f"Other variable costs ({currency_label()}/m²)",
+            min_value=0.0,
+            value=0.0,
+            help="Protective paper, chemicals, packaging, etc.",
+        )
+
+        st.markdown("---")
+        st.subheader("Laser cutting – detailed parameters")
+        col_l1, col_l2, col_l3 = st.columns(3)
+        laser_people = col_l1.number_input(
+            "Number of people in laser cutting",
+            min_value=0,
+            value=0,
+            step=1,
+        )
+        laser_hours_job = col_l2.number_input(
+            "Hours required for laser cutting (this job)",
+            min_value=0.0,
+            value=0.0,
+        )
+        laser_salary_month = col_l3.number_input(
+            f"Monthly salary per person in laser ({currency_label()})",
+            min_value=0.0,
+            value=0.0,
+        )
+
+        col_l4, col_l5 = st.columns(2)
+        laser_power_kw = col_l4.number_input(
+            "Laser machine power (kW)",
+            min_value=0.0,
+            value=0.0,
+            help="Typical small laser cutter: 1.0–3.0 kW, big units can be higher.",
+        )
+        col_l5.caption(
+            "Laser cutting cost = labour (people × hours × salary) "
+            "+ laser energy (kW × electricity price × hours)."
+        )
+
+        col_laser_dep1, col_laser_dep2, col_laser_dep3 = st.columns(3)
+        laser_machine_value = col_laser_dep1.number_input(
+            f"Laser machine value ({currency_label()})",
+            min_value=0.0,
+            value=0.0,
+        )
+        laser_useful_life_years = col_laser_dep2.number_input(
+            "Laser useful life (years)",
+            min_value=1.0,
+            value=5.0,
+        )
+        laser_hours_per_month = col_laser_dep3.number_input(
+            "Laser working hours per month (h)",
+            min_value=1.0,
+            value=220.0,
+        )
+
+        st.markdown("---")
+        st.subheader("Other additional services per metre")
+        col_serv1, col_serv2 = st.columns(2)
+        sewing_cost_per_m = col_serv1.number_input(
+            f"Internal sewing ({currency_label()}/m)",
+            min_value=0.0,
+            value=0.0,
+        )
+        col_serv2.markdown("")
+
+        st.markdown("---")
+        st.subheader("Equipment – energy & depreciation (Presto MAX)")
+        col_energy1, col_energy2, col_energy3 = st.columns(3)
+        energy_price_per_kwh = col_energy1.number_input(
+            f"Electricity price ({currency_label()}/kWh)",
+            min_value=0.0,
+            value=0.50,
+        )
+        power_consumption_kw = col_energy2.number_input(
+            "Machine power consumption (kW)",
+            min_value=0.0,
+            value=5.0,
+        )
+        machine_value = col_energy3.number_input(
+            f"Machine value ({currency_label()})",
+            min_value=0.0,
+            value=0.0,
+        )
+
+        col_dep1, col_dep2 = st.columns(2)
+        useful_life_years = col_dep1.number_input(
+            "Useful life (years)",
+            min_value=1.0,
+            value=5.0,
+        )
+        machine_hours_per_month = col_dep2.number_input(
+            "Machine working hours per month (h)",
+            min_value=1.0,
+            value=220.0,
+        )
+
+        energy_cost_per_hour = energy_price_per_kwh * power_consumption_kw
+        laser_energy_cost_per_hour = energy_price_per_kwh * laser_power_kw
+
+        st.markdown("---")
+        st.subheader("Labour (monthly salary → cost/h)")
+        hours_month = st.number_input(
+            "Working hours per month (h)",
+            min_value=1,
+            max_value=300,
+            value=220,
+            help="Typical value is around 220 h/month.",
+        )
+
+        roles = [
+            ("operator", "Machine operator"),
+            ("supervisor", "Operations supervisor"),
+            ("designer", "Designer / pre-press"),
+            ("sales", "Sales representative"),
+            ("finishing", "Product finishing"),
+        ]
+
+        labour_inputs: List[tuple] = []
+        for key, label in roles:
+            st.markdown(f"**{label}**")
+            col1, col2, col3 = st.columns(3)
+            salary = col1.number_input(
+                "Monthly salary",
+                min_value=0.0,
+                value=0.0,
+                key=f"sal_{key}",
+            )
+            hours_job = col2.number_input(
+                "Hours in this job",
+                min_value=0.0,
+                value=0.0,
+                key=f"hours_job_{key}",
+            )
+            qty = col3.number_input(
+                "Number of people",
+                min_value=0,
+                value=1,
+                step=1,
+                key=f"qty_{key}",
+            )
+            labour_inputs.append((label, salary, hours_job, qty))
+
+        bottom_nav()
+
+    # ------------------------- TAB: LASER SERVICE PRICING -----------------------
+    with tab_laser_price:
+        st.header("7. Laser Cutting Service Calculator")
+        st.caption("Independent tool to estimate the cost and selling price for laser cutting services.")
+
+        # --- 1. MAIN LASER JOB INPUTS (QUICK CALCULATOR) ---
+        st.subheader("A. Main laser job cost (quick calculator)")
+
+        col_las_in1, col_las_in2, col_las_in3 = st.columns(3)
+
+        def_width = st.session_state.get("width_m", 1.50) or 1.50
+        def_len = st.session_state.get("length_m", 100.0) or 100.0
+
+        l_width = col_las_in1.number_input(
+            "Roll width (m)",
+            min_value=0.0,
+            value=float(def_width),
+            key="las_width",
+            help="Usable width of the material on the laser table.",
+        )
+        l_length = col_las_in2.number_input(
+            "Total length to cut (m)",
+            min_value=0.0,
+            value=float(def_len),
+            key="las_length",
+            help="Total linear metres that will be processed in this laser job.",
+        )
+        col_las_in3.markdown("")
+
+        st.markdown("Define the cutting time for this laser job.")
+        l_hours_job = st.number_input(
+            "Total cutting time (hours)",
+            min_value=0.0,
+            value=1.0,
+            step=0.5,
+            help="Total time that the laser will be operating for this job.",
+        )
+
+        st.markdown("---")
+
+        # --- 2. HOURLY LASER COST PARAMETERS (LABOUR, ENERGY, DEPRECIATION) ---
+        st.subheader("B. Hourly cost structure for laser")
+
+        with st.expander("⚙️ Configure hourly costs (labour, energy, machine depreciation)", expanded=False):
+            st.info(
+                "The values below are based on the general configuration tab, "
+                "but you can adjust them specifically for this laser calculation."
+            )
+
+            c_l1, c_l2, c_l3 = st.columns(3)
+            val_people = laser_people if "laser_people" in locals() else 1
+            val_salary = laser_salary_month if "laser_salary_month" in locals() else 1500.0
+            val_hours_month = hours_month if "hours_month" in locals() else 220.0
+
+            in_laser_people = c_l1.number_input(
+                "Number of people in laser operation",
+                value=int(val_people),
+                min_value=0,
+                key="in_l_ppl",
+            )
+            in_laser_salary = c_l2.number_input(
+                f"Monthly salary per person ({currency_label()})",
+                value=float(val_salary),
+                min_value=0.0,
+                key="in_l_sal",
+            )
+            in_hours_month = c_l3.number_input(
+                "Working hours per month (h)",
+                value=float(val_hours_month),
+                min_value=1.0,
+                key="in_l_hmonth",
+            )
+
+            c_l4, c_l5, c_l6 = st.columns(3)
+            val_l_power = laser_power_kw if "laser_power_kw" in locals() else 2.0
+            val_e_price = energy_price_per_kwh if "energy_price_per_kwh" in locals() else 0.50
+
+            in_laser_power = c_l4.number_input(
+                "Laser machine power (kW)",
+                value=float(val_l_power),
+                min_value=0.0,
+                key="in_l_pow",
+            )
+            in_energy_price = c_l5.number_input(
+                f"Electricity price ({currency_label()}/kWh)",
+                value=float(val_e_price),
+                min_value=0.0,
+                key="in_l_eprice",
+            )
+
+            val_l_val = laser_machine_value if "laser_machine_value" in locals() else 50000.0
+            val_l_life = laser_useful_life_years if "laser_useful_life_years" in locals() else 5.0
+            val_l_hmonth = laser_hours_per_month if "laser_hours_per_month" in locals() else 220.0
+
+            in_laser_value = c_l6.number_input(
+                f"Laser machine value ({currency_label()})",
+                value=float(val_l_val),
+                min_value=0.0,
+                key="in_l_val",
+            )
+
+            # Hourly rate calculations
+            rate_labour = 0.0
+            if in_hours_month > 0:
+                rate_labour = (in_laser_salary / in_hours_month) * in_laser_people
+
+            rate_energy = in_laser_power * in_energy_price
+
+            rate_depreciation = 0.0
+            if val_l_life > 0 and val_l_hmonth > 0:
+                monthly_dep = in_laser_value / (val_l_life * 12.0)
+                rate_depreciation = monthly_dep / val_l_hmonth
+
+            total_rate_hour = rate_labour + rate_energy + rate_depreciation
+
+            st.caption(
+                f"Total hourly operating cost: {total_rate_hour:.2f} {currency_label()}/h "
+                f"(Labour: {rate_labour:.2f} + Energy: {rate_energy:.2f} + "
+                f"Depreciation: {rate_depreciation:.2f})"
+            )
+
+        # --- 3. MAIN LASER JOB RESULTS (COST + SUGGESTED SELLING PRICE) ---
+        if l_hours_job > 0:
+            cost_labour_total = rate_labour * l_hours_job
+            cost_energy_total = rate_energy * l_hours_job
+            cost_depr_total = rate_depreciation * l_hours_job
+
+            laser_total_job = cost_labour_total + cost_energy_total + cost_depr_total
+            laser_cost_per_m = laser_total_job / l_length if l_length > 0 else 0.0
+
+            st.session_state["laser_main_summary"] = {
+                "total_cost": laser_total_job,
+                "cost_per_m": laser_cost_per_m,
+                "hours": l_hours_job,
+                "length_m": l_length,
+            }
+            st.session_state["laser_main_breakdown"] = {
+                "labour": cost_labour_total,
+                "energy": cost_energy_total,
+                "depreciation": cost_depr_total,
+            }
+
+            st.subheader("C. Main laser cost results")
+            col_res1, col_res2, col_res3 = st.columns(3)
+            col_res1.metric(
+                f"Total job cost ({currency_label()})",
+                f"{laser_total_job:.2f}",
+            )
+            col_res2.metric(
+                f"Cost per linear metre ({currency_label()})",
+                f"{laser_cost_per_m:.2f}",
+            )
+            col_res3.metric(
+                "Total cutting time",
+                f"{l_hours_job:.2f} h",
+            )
+
+            st.markdown("**Cost breakdown (main laser job)**")
+            fig_l, ax_l = plt.subplots(figsize=(5, 2.5))
+            l_labels = ["Labour", "Energy", "Depreciation"]
+            l_values = [cost_labour_total, cost_energy_total, cost_depr_total]
+            ax_l.barh(l_labels, l_values)
+            ax_l.set_title(f"Total cost: {laser_total_job:.2f} {currency_label()}")
+            for i, v in enumerate(l_values):
+                ax_l.text(v, i, f" {v:.2f}", va="center", fontsize=8)
+            st.pyplot(fig_l)
+
+            st.markdown("---")
+            st.subheader("D. Selling price for main laser job")
+
+            target_margin_main = st.number_input(
+                "Desired profit margin for this laser job (%)",
+                value=40.0,
+                step=5.0,
+                key="las_margin_main",
+            )
+
+            if target_margin_main < 100 and laser_total_job > 0:
+                suggested_price_total = laser_total_job / (1 - target_margin_main / 100.0)
+                suggested_price_m = suggested_price_total / l_length if l_length > 0 else 0.0
+                profit_main = suggested_price_total - laser_total_job
+            else:
+                suggested_price_total = 0.0
+                suggested_price_m = 0.0
+                profit_main = 0.0
+
+            col_p1, col_p2, col_p3 = st.columns(3)
+            col_p1.metric(
+                "Suggested price (total job)",
+                f"{currency_label()} {suggested_price_total:.2f}",
+            )
+            col_p2.metric(
+                "Suggested price (per metre)",
+                f"{currency_label()} {suggested_price_m:.2f}",
+            )
+            col_p3.metric(
+                "Estimated profit (total job)",
+                f"{currency_label()} {profit_main:.2f}",
+                delta=f"{target_margin_main:.0f}%",
+            )
+        else:
+            st.warning("Please enter the cutting time to calculate the main laser cost.")
+
+        st.markdown("---")
+        st.subheader("E. Independent laser cutting job")
+
+        st.markdown(
+            "Use this section when you want to quote **laser cutting as a separate service**, "
+            "independent from the printing job. Enter the dimensions and hours for this specific job."
+        )
+
+        col_ljob1, col_ljob2, col_ljob3 = st.columns(3)
+        laser_job_width_m = col_ljob1.number_input(
+            "Laser job width (m)",
+            min_value=0.0,
+            value=1.50,
+            key="laser_job_width_m",
+            help="Usable width of the material to be cut.",
+        )
+        laser_job_length_m = col_ljob2.number_input(
+            "Laser job length (m)",
+            min_value=0.0,
+            value=100.0,
+            key="laser_job_length_m",
+            help="Total length that will be processed in this laser job.",
+        )
+        laser_job_waste_pct = col_ljob3.number_input(
+            "Laser waste (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=0.0,
+            key="laser_job_waste_pct",
+            help="Losses at start/end, tests, alignment, etc. for this laser job.",
+        )
+
+        length_laser_effective = laser_job_length_m * (1.0 + laser_job_waste_pct / 100.0)
+        area_laser_effective = laser_job_width_m * length_laser_effective
+
+        laser_hours_job_tab = st.number_input(
+            "Hours required for this independent laser job",
+            min_value=0.0,
+            value=float(l_hours_job),
+            key="laser_hours_job_tab",
+            help="Total hours that the laser will operate for this specific job.",
+        )
+
+        if (
+            in_laser_people > 0
+            and laser_hours_job_tab > 0
+            and in_hours_month > 0
+            and in_laser_salary > 0
+        ):
+            laser_cost_per_hour_per_person_tab = in_laser_salary / float(in_hours_month)
+            laser_labour_cost_tab = (
+                laser_cost_per_hour_per_person_tab * laser_hours_job_tab * in_laser_people
+            )
+        else:
+            laser_labour_cost_tab = 0.0
+
+        if laser_hours_job_tab > 0 and rate_energy > 0:
+            laser_energy_cost_tab = rate_energy * laser_hours_job_tab
+        else:
+            laser_energy_cost_tab = 0.0
+
+        if laser_hours_job_tab > 0 and rate_depreciation > 0:
+            laser_depreciation_cost_tab = rate_depreciation * laser_hours_job_tab
+        else:
+            laser_depreciation_cost_tab = 0.0
+
+        laser_total_tab = laser_labour_cost_tab + laser_energy_cost_tab + laser_depreciation_cost_tab
+        laser_cost_per_m_tab = (
+            laser_total_tab / length_laser_effective if length_laser_effective > 0 else 0.0
+        )
+
+        df_laser_independent_summary = pd.DataFrame(
+            [
+                {
+                    "Laser job width (m)": laser_job_width_m,
+                    "Laser job length (m)": laser_job_length_m,
+                    "Laser waste (%)": laser_job_waste_pct,
+                    "Effective length (m, incl. waste)": length_laser_effective,
+                    "Effective area (m², incl. waste)": area_laser_effective,
+                    "Hours required (h)": laser_hours_job_tab,
+                    "Laser cost total": laser_total_tab,
+                    "Laser cost per linear metre": laser_cost_per_m_tab,
+                }
+            ]
+        )
+
+        st.markdown("**Cost summary – independent laser job**")
+        col_lsum1, col_lsum2, col_lsum3, col_lsum4 = st.columns(4)
+        col_lsum1.metric(
+            f"Total laser cost ({currency_label()})",
+            f"{laser_total_tab:.2f}",
+        )
+        col_lsum2.metric(
+            "Effective length for laser (m)",
+            f"{length_laser_effective:.2f}",
+        )
+        col_lsum3.metric(
+            "Effective area for laser (m²)",
+            f"{area_laser_effective:.2f}",
+        )
+        col_lsum4.metric(
+            f"Laser cost per linear metre ({currency_label()})",
+            f"{laser_cost_per_m_tab:.4f}",
+        )
+
+        st.markdown("---")
+        st.markdown("**Pricing scenarios – independent laser job**")
+
+        base_metric_laser = st.radio(
+            "Base unit for independent laser selling price",
+            ["Per job", "Per linear metre"],
+            index=1,
+            horizontal=True,
+            key="laser_base_metric_radio",
+        )
+
+        if base_metric_laser.startswith("Per job"):
+            base_cost_laser = laser_total_tab
+            base_label_laser = f"Laser selling price per job ({currency_label()})"
+            profit_label_laser = f"Laser profit per job ({currency_label()})"
+        else:
+            base_cost_laser = laser_cost_per_m_tab
+            base_label_laser = f"Laser selling price per linear metre ({currency_label()})"
+            profit_label_laser = f"Laser profit per linear metre ({currency_label()})"
+
+        target_margin_laser = st.number_input(
+            "Target profit margin for independent laser job (%)",
+            min_value=0.0,
+            max_value=300.0,
+            value=30.0,
+            key="target_margin_laser",
+        )
+
+        raw_margins_laser = [
+            max(0.0, target_margin_laser - 10),
+            max(0.0, target_margin_laser - 5),
+            target_margin_laser,
+            target_margin_laser + 5,
+            target_margin_laser + 10,
+        ]
+        margins_laser = sorted({m for m in raw_margins_laser if m < 100.0})
+
+        rows_laser = []
+        for m in margins_laser:
+            if base_cost_laser > 0 and m < 100.0:
+                price = base_cost_laser / (1.0 - m / 100.0)
+                profit = price - base_cost_laser
+                markup = price / base_cost_laser if base_cost_laser > 0 else 0.0
+            else:
+                price = profit = markup = 0.0
+            rows_laser.append(
+                {
+                    "Margin (%)": m,
+                    base_label_laser: price,
+                    profit_label_laser: profit,
+                    "Markup (× cost)": markup,
+                }
+            )
+
+        df_laser = pd.DataFrame(rows_laser)
+        col_tbl_ind, col_chart_ind = st.columns([1.4, 1])
+
+        with col_tbl_ind:
+            st.markdown("**Table – Suggested prices for independent laser job**")
+            st.dataframe(df_laser, use_container_width=True)
+
+        with col_chart_ind:
+            fig_lp, ax_lp = plt.subplots(figsize=(4.5, 3))
+            ax_lp.bar(df_laser["Margin (%)"], df_laser[base_label_laser])
+            ax_lp.set_xlabel("Margin (%)")
+            ax_lp.set_ylabel(base_label_laser)
+            ax_lp.set_title("Independent laser selling price vs. margin")
+            fig_lp.tight_layout()
+            st.pyplot(fig_lp)
+
+        st.markdown("**User-defined price and real margin – independent laser job**")
+        col_lu1, col_lu2, col_lu3 = st.columns(3)
+        selling_price_laser_user = col_lu1.number_input(
+            base_label_laser,
+            min_value=0.0,
+            value=0.0,
+            help="Enter the price you plan to charge for the independent laser service.",
+            key="selling_price_laser_user",
+        )
+
+        if selling_price_laser_user > 0 and base_cost_laser > 0:
+            profit_laser_user = selling_price_laser_user - base_cost_laser
+            margin_laser_user_pct = (profit_laser_user / selling_price_laser_user) * 100.0
+        else:
+            profit_laser_user = 0.0
+            margin_laser_user_pct = 0.0
+
+        col_lu2.metric(
+            profit_label_laser,
+            f"{profit_laser_user:.4f}",
+            help="Difference between selling price and cost per base unit.",
+        )
+        col_lu3.metric(
+            "Real profit margin (%) – independent laser job",
+            f"{margin_laser_user_pct:.2f}%",
+        )
+
+        st.markdown("**Cost vs selling price vs profit – independent laser job**")
+        fig_lcp, ax_lcp = plt.subplots()
+        labels_laser_unit = ["Laser cost per unit", "Selling price", "Profit per unit"]
+        values_laser_unit = [
+            base_cost_laser,
+            selling_price_laser_user,
+            profit_laser_user if profit_laser_user > 0 else 0.0,
+        ]
+        ax_lcp.bar(labels_laser_unit, values_laser_unit)
+        ax_lcp.set_ylabel(f"Value ({currency_label()})")
+        ax_lcp.set_title("Unit economics – independent laser service")
+        for i, v in enumerate(values_laser_unit):
+            ax_lcp.text(i, v, f"{v:,.2f}", ha="center", va="bottom", fontsize=8)
+        fig_lcp.tight_layout()
+        st.pyplot(fig_lcp)
+
+        st.markdown("---")
+        st.subheader("Export laser service report")
+        st.caption(
+            "Download an Excel report with the main laser job, independent laser job and laser-only pricing scenarios."
+        )
+
+        main_summary = st.session_state.get("laser_main_summary")
+        main_breakdown = st.session_state.get("laser_main_breakdown")
+
+        if main_summary is not None:
+            df_laser_main_summary = pd.DataFrame(
+                [
+                    {
+                        "Total job cost": main_summary.get("total_cost", 0.0),
+                        "Cost per linear metre": main_summary.get("cost_per_m", 0.0),
+                        "Total length (m)": main_summary.get("length_m", 0.0),
+                        "Cutting time (h)": main_summary.get("hours", 0.0),
+                    }
+                ]
+            )
+        else:
+            df_laser_main_summary = pd.DataFrame()
+
+        if main_breakdown is not None:
+            df_laser_main_breakdown = pd.DataFrame(
+                [{"Component": key.capitalize(), "Cost": value} for key, value in main_breakdown.items()]
+            )
+        else:
+            df_laser_main_breakdown = pd.DataFrame()
+
+        laser_excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(laser_excel_buffer, engine="xlsxwriter") as writer:
+            if not df_laser_main_summary.empty:
+                df_laser_main_summary.to_excel(
+                    writer, sheet_name="Main_laser_job", index=False
+                )
+            if not df_laser_main_breakdown.empty:
+                df_laser_main_breakdown.to_excel(
+                    writer, sheet_name="Main_laser_breakdown", index=False
+                )
+
+            if not df_laser_independent_summary.empty:
+                df_laser_independent_summary.to_excel(
+                    writer, sheet_name="Independent_summary", index=False
+                )
+            if not df_laser.empty:
+                df_laser.to_excel(
+                    writer, sheet_name="Independent_scenarios", index=False
+                )
+
+        laser_excel_buffer.seek(0)
+
+        st.download_button(
+            "📥 Download laser service Excel report",
+            data=laser_excel_buffer,
+            file_name="laser_service_pricing_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        bottom_nav()
+
+    # ------------------------- TAB: JOB & PRINT MODE ----------------------
+    with tab_job:
+        st.header("1. Job information & print mode")
+
+        col_dim1, col_dim2, col_dim3 = st.columns(3)
+        width_m = col_dim1.number_input(
+            "Usable print width (m)",
+            min_value=0.0,
+            value=1.80,
+        )
+        length_m = col_dim2.number_input(
+            "Total job length (m)",
+            min_value=0.0,
+            value=500.0,
+        )
+        waste_pct = col_dim3.number_input(
+            "Waste (%)",
+            min_value=0.0,
+            max_value=50.0,
+            value=3.0,
+            help="Losses at start/end of roll, tests, joins, etc.",
+        )
+
+        st.markdown("---")
+        col_mode, col_post = st.columns(2)
+        mode_name = col_mode.selectbox(
+            "Print mode",
+            list(PRINT_MODES.keys()),
+            index=2,
+        )
+        speed_m2h = float(PRINT_MODES[mode_name]["speed"])
+
+        post_h = col_post.number_input(
+            "Extra hours (post-process)",
+            min_value=0.0,
+            value=0.0,
+            help="Washing, heavy finishing, etc.",
+        )
+
+        base_area_m2_job = width_m * length_m
+        if speed_m2h > 0:
+            est_time_h = base_area_m2_job / speed_m2h
+        else:
+            est_time_h = 0.0
+
+        est_hours_int = int(est_time_h)
+        est_minutes_int = int(max(0.0, (est_time_h - est_hours_int) * 60.0))
+
+        st.markdown("### Estimated production time (Presto)")
+        col_t1, col_t2 = st.columns(2)
+        col_t1.metric(
+            "Estimated time (hours)",
+            f"{est_time_h:.2f} h",
+        )
+        col_t2.metric(
+            "Estimated time (h + min)",
+            f"{est_hours_int} h {est_minutes_int:02d} min",
+        )
+
+        st.session_state["width_m"] = width_m
+        st.session_state["length_m"] = length_m
+
+        bottom_nav()
+
+    # ------------------------- TAB: INK CONSUMPTION -----------------------
+    ml_map_m2: Dict[str, float] = {}
+    ml_map_pdf: Dict[str, float] = {}
+    has_ink_data = False
+
+    with tab_ink:
+        st.header("2. Ink consumption")
+
+        if consumption_source.startswith("Machine"):
+            st.subheader("XML source (machine ZIP)")
+            up = st.file_uploader(
+                "Upload the ZIP generated by the Presto MAX",
+                type=["zip"],
+                key="zip_upload",
+            )
+            if up is not None:
+                zbytes = up.getvalue()
+                xml_name, xml_bytes = pick_xml_from_zip(zbytes)
+                if xml_bytes is None:
+                    st.error("No XML file found inside the ZIP. Please check the file.")
+                else:
+                    ml_map_m2 = ml_per_m2_from_xml_bytes(xml_bytes)
+                    has_ink_data = True
+                    st.success(f"Found XML: `{xml_name}`")
+
+                    df_xml = pd.DataFrame(
+                        [{"Channel": k, "ml/m²": v} for k, v in ml_map_m2.items()]
+                    )
+
+                    col_xml_tbl, col_xml_chart = st.columns([1.1, 1.3])
+
+                    with col_xml_tbl:
+                        st.markdown("**Table – Ink consumption per channel (ml/m²)**")
+                        st.dataframe(df_xml, use_container_width=True)
+
+                    with col_xml_chart:
+                        st.markdown("**Chart – Ink consumption per channel (ml/m²)**")
+                        fig_xml, ax_xml = plt.subplots(figsize=(6.5, 4.0))
+                        channels_xml = df_xml["Channel"]
+                        values_xml = df_xml["ml/m²"]
+                        colors_xml = PALETTE_MAIN[: len(channels_xml)]
+                        ax_xml.barh(channels_xml, values_xml, color=colors_xml)
+                        ax_xml.set_xlabel("ml/m²")
+                        ax_xml.set_title("Ink consumption per channel (from XML)")
+                        for i, v in enumerate(values_xml):
+                            ax_xml.text(
+                                v,
+                                i,
+                                f"{v:,.2f}",
+                                va="center",
+                                ha="left",
+                                fontsize=8,
+                            )
+                        fig_xml.tight_layout()
+                        st.pyplot(fig_xml)
+            else:
+                st.info("Upload the machine ZIP to automatically calculate consumption.")
+
+        elif consumption_source.startswith("Manual"):
+            st.subheader("Manual consumption (ml/m²)")
+            col_c, col_w, col_f = st.columns(3)
+            man_color = col_c.number_input("Color (ml/m²)", min_value=0.0, value=8.0)
+            man_white = col_w.number_input("White (ml/m²)", min_value=0.0, value=0.0)
+            man_fof = col_f.number_input(
+                "FOF / pretreatment (ml/m²)", min_value=0.0, value=3.0
+            )
+            ml_map_m2 = {"Color": man_color, "White": man_white, "FOF": man_fof}
+            has_ink_data = True
+
+        else:
+            st.subheader("ControlCenter PDF report")
+            if PdfReader is None:
+                st.error(
+                    "PDF reading is disabled. Install the 'PyPDF2' package "
+                    "with `pip install PyPDF2` to use this option."
+                )
+            else:
+                up_pdf = st.file_uploader(
+                    "Upload the ControlCenter job report (PDF)",
+                    type=["pdf"],
+                    key="pdf_upload_controlcenter",
+                )
+                if up_pdf is not None:
+                    pdf_bytes = up_pdf.getvalue()
+                    try:
+                        info = parse_controlcenter_pdf(pdf_bytes)
+                    except Exception as e:
+                        st.error(f"Could not parse the ControlCenter PDF: {e}")
+                    else:
+                        ml_map_m2 = info.get("ml_map_m2", {}) or {}
+                        ml_map_pdf = dict(ml_map_m2)
+
+                        if not ml_map_m2:
+                            st.error(
+                                "No ink consumption line could be extracted from the PDF. "
+                                "Please check that this is a valid ControlCenter job report."
+                            )
+                        else:
+                            has_ink_data = True
+                            width_pdf = float(info.get("width_m", 0.0))
+                            length_pdf = float(info.get("length_m", 0.0))
+                            job_name = info.get("job_name", "")
+
+                            st.markdown("**Job data extracted from PDF**")
+                            col_pdf1, col_pdf2, col_pdf3 = st.columns(3)
+                            col_pdf1.metric(
+                                "Job width from PDF (m)",
+                                f"{width_pdf:.2f}",
+                            )
+                            col_pdf2.metric(
+                                "Job length from PDF (m)",
+                                f"{length_pdf:.2f}",
+                            )
+                            total_ml_m2 = sum(ml_map_m2.values())
+                            col_pdf3.metric(
+                                "Total ink + DS (ml/m²)",
+                                f"{total_ml_m2:.2f}",
+                            )
+
+                            if job_name:
+                                st.caption(f"Job name: `{job_name}`")
+
+                            df_pdf = pd.DataFrame(
+                                [{"Channel": k, "ml/m²": v} for k, v in ml_map_m2.items()]
+                            )
+
+                            col_pdf_tbl, col_pdf_chart = st.columns([1.1, 1.3])
+
+                            with col_pdf_tbl:
+                                st.markdown(
+                                    "**Table – Ink consumption per channel (ml/m², from PDF)**"
+                                )
+                                st.dataframe(df_pdf, use_container_width=True)
+
+                            with col_pdf_chart:
+                                fig_pdf, ax_pdf = plt.subplots(figsize=(6.5, 4.0))
+                                channels_pdf = df_pdf["Channel"]
+                                values_pdf = df_pdf["ml/m²"]
+
+                                channel_color_map = {
+                                    "Cyan": "#22c1dc",
+                                    "Magenta": "#ec4899",
+                                    "Yellow": "#eab308",
+                                    "Black": "#111827",
+                                    "Red": "#ef4444",
+                                    "Green": "#22c55e",
+                                    "Fixation": "#6b7280",
+                                }
+
+                                bar_colors = [
+                                    channel_color_map.get(str(ch), PALETTE_MAIN[0])
+                                    for ch in channels_pdf
+                                ]
+
+                                ax_pdf.barh(channels_pdf, values_pdf, color=bar_colors)
+                                ax_pdf.set_xlabel("ml/m²")
+                                ax_pdf.set_title("Ink consumption per channel (from PDF)")
+                                for i, v in enumerate(values_pdf):
+                                    ax_pdf.text(
+                                        v,
+                                        i,
+                                        f"{v:,.2f}",
+                                        va="center",
+                                        ha="left",
+                                        fontsize=8,
+                                    )
+                                fig_pdf.tight_layout()
+                                st.pyplot(fig_pdf)
+
+                            st.info(
+                                "Use the width and length values in the "
+                                "**Job & print mode** tab if you want this job "
+                                "to match exactly the ControlCenter report."
+                            )
+                else:
+                    st.info(
+                        "Upload the ControlCenter job report (PDF) to "
+                        "automatically calculate ink and Duo Soft consumption."
+                    )
+
+        if ml_map_pdf:
+            st.session_state["ml_map_pdf"] = ml_map_pdf
+
+        st.session_state["ml_map_m2"] = ml_map_m2
+        bottom_nav()
+
+    # ------------------------- TAB: COST RESULTS --------------------------
+    with tab_results:
+        st.header("3. Cost results")
+
+        ml_map_m2 = st.session_state.get("ml_map_m2", {}) or {}
+
+        if st.button("Compute job cost", type="primary", key="btn_compute"):
+            st.session_state["calc"] = compute_full_job(
+                width_m=width_m,
+                length_m=length_m,
+                waste_pct=waste_pct,
+                speed_m2h=speed_m2h,
+                ml_map_m2=ml_map_m2,
+                ink_color_per_l=ink_color_per_l,
+                ink_white_per_l=ink_white_per_l,
+                fof_per_l=fof_per_l,
+                fabric_cost_per_m2=fabric_cost_per_m2,
+                other_var_simple_per_m2=other_var_simple_per_m2,
+                laser_people=laser_people,
+                laser_hours_job=laser_hours_job,
+                laser_salary_month=laser_salary_month,
+                laser_energy_cost_per_hour=laser_energy_cost_per_hour,
+                laser_machine_value=laser_machine_value,
+                laser_useful_life_years=laser_useful_life_years,
+                laser_hours_per_month=laser_hours_per_month,
+                sewing_cost_per_m=sewing_cost_per_m,
+                hours_month=hours_month,
+                labour_inputs=labour_inputs,
+                energy_cost_per_hour=energy_cost_per_hour,
+                machine_value=machine_value,
+                useful_life_years=useful_life_years,
+                machine_hours_per_month=machine_hours_per_month,
+                post_h=post_h,
+            )
+
+        calc = st.session_state.get("calc")
+        if not calc:
+            st.info(
+                "Adjust the configuration, job and ink data, then click "
+                "**Compute job cost** to see the results."
+            )
+        else:
+            res = calc["res"]
+            cost_energy = calc["cost_energy"]
+            cost_depreciation = calc["cost_depreciation"]
+            total_cost_with_energy = calc["total_cost_with_energy"]
+            cost_per_m2_with_energy = calc["cost_per_m2_with_energy"]
+            cost_per_m_with_energy = calc["cost_per_m_with_energy"]
+
+            st.subheader("Job summary")
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric(
+                "Printed area (m², incl. waste)",
+                f"{res['area_with_waste']:.2f}",
+            )
+            col_b.metric(
+                "Total length (m, incl. waste)",
+                f"{res['length_with_waste']:.2f}",
+            )
+            col_c.metric(
+                "Estimated print time (h)",
+                f"{res['time_print_h']:.2f}",
+            )
+
+            st.markdown("### Total costs for this job")
+            col1, col2, col3 = st.columns(3)
+            col1.metric(
+                f"Total job cost ({currency_label()})",
+                f"{total_cost_with_energy:.2f}",
+            )
+            col2.metric(
+                f"Cost per m² ({currency_label()})",
+                f"{cost_per_m2_with_energy:.4f}",
+            )
+            col3.metric(
+                f"Cost per linear metre ({currency_label()})",
+                f"{cost_per_m_with_energy:.4f}",
+            )
+
+            cost_ink = res["cost_ink"]
+            cost_media = res["cost_media"]
+            cost_other = res["cost_other"]
+            cost_labour = res["cost_labour"]
+
+            data_costs = [
+                ("Ink", cost_ink),
+                ("Fabric/media", cost_media),
+                ("Other variables (incl. laser + sewing)", cost_other),
+                ("Labour (all roles)", cost_labour),
+                ("Energy", cost_energy),
+                ("Depreciation", cost_depreciation),
+            ]
+            cost_col = f"Total cost ({currency_label()})"
+            df_costs = pd.DataFrame(data_costs, columns=["Category", cost_col])
+
+            st.markdown("### Cost breakdown by category")
+            col_cost_tbl, col_cost_chart = st.columns([1.1, 1.3])
+
+            with col_cost_tbl:
+                st.markdown("**Table – Cost by category (total job)**")
+                st.dataframe(df_costs, use_container_width=True)
+
+            with col_cost_chart:
+                fig1, ax1 = plt.subplots(figsize=(6.5, 4.0))
+                categories = df_costs["Category"]
+                values = df_costs[cost_col]
+                colors = PALETTE_MAIN[: len(categories)]
+                ax1.barh(categories, values, color=colors)
+                ax1.set_xlabel(cost_col)
+                ax1.set_title("Cost by category")
+                for i, v in enumerate(values):
+                    ax1.text(
+                        v,
+                        i,
+                        f"{v:,.2f}",
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                    )
+                fig1.tight_layout()
+                st.pyplot(fig1)
+
+            st.markdown("### Share of total cost (%)")
+            total_for_pct = df_costs[cost_col].sum() or 1.0
+            df_pct = df_costs.copy()
+            df_pct["% of total"] = (df_pct[cost_col] / total_for_pct) * 100.0
+
+            col_pct_tbl, col_pct_chart = st.columns([1.1, 1.3])
+
+            with col_pct_tbl:
+                st.markdown("**Table – Share of total cost (%)**")
+                st.dataframe(df_pct, use_container_width=True)
+
+            with col_pct_chart:
+                fig2, ax2 = plt.subplots(figsize=(6.5, 4.0))
+                categories_pct = df_pct["Category"]
+                pct_values = df_pct["% of total"]
+                colors_pct = PALETTE_MAIN[: len(categories_pct)]
+                ax2.barh(categories_pct, pct_values, color=colors_pct)
+                ax2.set_xlabel("% of total cost")
+                ax2.set_title("Cost share (%) by category")
+                ax2.set_xlim(0, 100)
+                for i, v in enumerate(pct_values):
+                    ax2.text(
+                        v,
+                        i,
+                        f"{v:,.1f}%",
+                        va="center",
+                        ha="left",
+                        fontsize=8,
+                    )
+                fig2.tight_layout()
+                st.pyplot(fig2)
+
+            st.success("Calculation complete. You can now explore the other tabs.")
+
+            # -------------------- Export report (Excel & PDF) --------------------
+            st.markdown("---")
+            st.subheader("Export job report")
+
+            labour_breakdown = calc["labour_breakdown"]
+            filtered_labour_inputs = calc["filtered_labour_inputs"]
+            laser_total = calc["laser_total"]
+            sewing_total = calc["sewing_total"]
+            others_simple_total = calc["others_simple_total"]
+            monthly_depreciation = calc["monthly_depreciation"]
+            depreciation_per_hour = calc["depreciation_per_hour"]
+            time_total_h = calc["time_total_h"]
+
+            df_summary = pd.DataFrame(
+                [
+                    {
+                        "Printed area (m², incl. waste)": res["area_with_waste"],
+                        "Total length (m, incl. waste)": res["length_with_waste"],
+                        "Estimated print time (h)": res["time_print_h"],
+                        "Presto machine running time (h)": time_total_h,
+                        "Total job cost": total_cost_with_energy,
+                        "Cost per m²": cost_per_m2_with_energy,
+                        "Cost per linear metre": cost_per_m_with_energy,
+                    }
+                ]
+            )
+
+            if labour_breakdown:
+                df_lab = pd.DataFrame(
+                    [
+                        {
+                            "Role": label,
+                            "Number of people": qty,
+                            f"Monthly salary per person ({currency_label()})": salary,
+                            "Cost per hour (per person)": cost_per_h,
+                            "Hours in this job (per person)": hours_job,
+                            f"Cost per person in this job ({currency_label()})": cost_job_per_person,
+                            f"Total cost in this job ({currency_label()})": cost_job_total,
+                        }
+                        for (label, salary, hours_job, qty), (
+                            _lbl2,
+                            cost_per_h,
+                            _hrs2,
+                            _qty2,
+                            cost_job_per_person,
+                            cost_job_total,
+                        ) in zip(filtered_labour_inputs, labour_breakdown)
+                    ]
+                )
+            else:
+                df_lab = pd.DataFrame()
+
+            df_serv = pd.DataFrame(
+                [
+                    {
+                        "Service": "Laser cutting (labour)",
+                        "Base": "job",
+                        "Total cost": calc.get("laser_labour", 0.0),
+                    },
+                    {
+                        "Service": "Laser cutting (energy)",
+                        "Base": "job",
+                        "Total cost": calc.get("laser_energy", 0.0),
+                    },
+                    {
+                        "Service": "Laser cutting (depreciation)",
+                        "Base": "job",
+                        "Total cost": calc.get("laser_depreciation_cost", 0.0),
+                    },
+                    {
+                        "Service": "Laser cutting (total)",
+                        "Base": "job",
+                        "Total cost": laser_total,
+                    },
+                    {
+                        "Service": "Internal sewing",
+                        "Base": "per metre",
+                        "Total cost": sewing_total,
+                    },
+                    {
+                        "Service": "Other simple variables",
+                        "Base": "per m²",
+                        "Total cost": others_simple_total,
+                    },
+                ]
+            )
+
+            df_energy = pd.DataFrame(
+                [
+                    {"Metric": "Presto machine running time (h)", "Value": time_total_h},
+                    {"Metric": f"Energy cost ({currency_label()})", "Value": cost_energy},
+                    {
+                        "Metric": f"Monthly depreciation ({currency_label()})",
+                        "Value": monthly_depreciation,
+                    },
+                    {
+                        "Metric": f"Depreciation cost per hour ({currency_label()}/h)",
+                        "Value": depreciation_per_hour,
+                    },
+                    {
+                        "Metric": f"Depreciation cost (this job) ({currency_label()})",
+                        "Value": cost_depreciation,
+                    },
+                ]
+            )
+
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+                df_summary.to_excel(writer, sheet_name="Summary", index=False)
+                df_costs.to_excel(writer, sheet_name="Costs_by_category", index=False)
+                df_pct.to_excel(writer, sheet_name="Cost_share_pct", index=False)
+                if not df_lab.empty:
+                    df_lab.to_excel(writer, sheet_name="Labour", index=False)
+                df_serv.to_excel(writer, sheet_name="Services", index=False)
+                df_energy.to_excel(writer, sheet_name="Equipment", index=False)
+            excel_buffer.seek(0)
+
+            st.download_button(
+                "📊 Download Excel report",
+                data=excel_buffer,
+                file_name="presto_job_cost_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            # --------- PDF (single-page summary) ----------
+            if FPDF is None:
+                st.info(
+                    "PDF export is disabled. Install the 'fpdf2' package "
+                    "(`pip install fpdf2`) to enable PDF reports."
+                )
+            else:
+                cur_pdf = currency_label()
+                try:
+                    cur_pdf = cur_pdf.encode("ascii").decode("ascii")
+                except Exception:
+                    cur_pdf = "$"
+
+                pdf = FPDF()
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+
+                pdf.set_font("Arial", "B", 16)
+                pdf.cell(0, 10, "Presto MAX - Job Cost Report", ln=True)
+
+                pdf.set_font("Arial", size=11)
+                pdf.ln(4)
+                pdf.cell(
+                    0,
+                    8,
+                    f"Printed area (m2, incl. waste): {res['area_with_waste']:.2f}",
+                    ln=True,
+                )
+                pdf.cell(
+                    0,
+                    8,
+                    f"Total length (m, incl. waste): {res['length_with_waste']:.2f}",
+                    ln=True,
+                )
+                pdf.cell(
+                    0,
+                    8,
+                    f"Estimated print time (h): {res['time_print_h']:.2f}",
+                    ln=True,
+                )
+                pdf.cell(
+                    0,
+                    8,
+                    f"Presto machine running time (h): {time_total_h:.2f}",
+                    ln=True,
+                )
+
+                pdf.ln(4)
+                pdf.cell(
+                    0,
+                    8,
+                    f"Total job cost ({cur_pdf}): {total_cost_with_energy:.2f}",
+                    ln=True,
+                )
+                pdf.cell(
+                    0,
+                    8,
+                    f"Cost per m2 ({cur_pdf}): {cost_per_m2_with_energy:.4f}",
+                    ln=True,
+                )
+                pdf.cell(
+                    0,
+                    8,
+                    f"Cost per linear metre ({cur_pdf}): {cost_per_m_with_energy:.4f}",
+                    ln=True,
+                )
+
+                pdf.ln(6)
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 8, "Cost breakdown by category", ln=True)
+
+                pdf.set_font("Arial", size=10)
+                col1_w = 80
+                col2_w = 40
+                col3_w = 40
+                pdf.cell(col1_w, 7, "Category", border=1)
+                pdf.cell(col2_w, 7, f"Cost ({cur_pdf})", border=1)
+                pdf.cell(col3_w, 7, "% of total", border=1, ln=True)
+
+                for _, row in df_pct.iterrows():
+                    pdf.cell(col1_w, 7, str(row["Category"]), border=1)
+                    pdf.cell(col2_w, 7, f"{row[cost_col]:.2f}", border=1)
+                    pdf.cell(col3_w, 7, f"{row['% of total']:.1f}%", border=1, ln=True)
+
+                if calc.get("laser_total", 0.0) > 0:
+                    pdf.ln(4)
+                    pdf.set_font("Arial", "B", 12)
+                    pdf.cell(0, 8, "Laser cutting services (summary)", ln=True)
+                    pdf.set_font("Arial", size=10)
+                    pdf.cell(
+                        0,
+                        6,
+                        f"Laser total cost (labour + energy + depreciation): "
+                        f"{calc['laser_total']:.2f} {cur_pdf}",
+                        ln=True,
+                    )
+
+                pdf_buffer = io.BytesIO()
+                pdf.output(pdf_buffer)
+                pdf_buffer.seek(0)
+
+                st.download_button(
+                    "📄 Download PDF report",
+                    data=pdf_buffer,
+                    file_name="presto_job_cost_report.pdf",
+                    mime="application/pdf",
+                )
+
+            bottom_nav()
+
+    # ------------------------- TAB: SELLING PRICE -------------------------
+    with tab_price:
+        st.header("4. Selling price & margins")
+
+        calc = st.session_state.get("calc")
+        if not calc:
+            st.info("First compute the job cost in **Cost results**.")
+        else:
+            res = calc["res"]
+            cost_per_m2 = calc["cost_per_m2_with_energy"]
+            cost_per_m = calc["cost_per_m_with_energy"]
+
+            st.subheader("A. Base unit for pricing")
+            base_unit = st.radio(
+                "Choose the base unit for pricing:",
+                ["Per m²", "Per linear metre"],
+                index=1,
+                horizontal=True,
+            )
+            if base_unit.startswith("Per m²"):
+                base_cost = cost_per_m2
+                base_label = f"Selling price per m² ({currency_label()})"
+                profit_label = f"Profit per m² ({currency_label()})"
+            else:
+                base_cost = cost_per_m
+                base_label = f"Selling price per linear metre ({currency_label()})"
+                profit_label = f"Profit per linear metre ({currency_label()})"
+
+            st.markdown("---")
+            st.subheader("B. Suggested prices by margin")
+
+            col_marg1, col_marg2 = st.columns(2)
+            target_margin = col_marg1.number_input(
+                "Target profit margin (%)",
+                min_value=0.0,
+                max_value=300.0,
+                value=40.0,
+            )
+            col_marg2.caption(
+                "The table below will create a margin ladder around the target margin."
+            )
+
+            if base_cost <= 0:
+                st.warning("Base cost is zero. Please check the cost calculation.")
+            else:
+                raw_margins = [
+                    max(0.0, target_margin - 10),
+                    max(0.0, target_margin - 5),
+                    target_margin,
+                    target_margin + 5,
+                    target_margin + 10,
+                ]
+                margins = sorted({m for m in raw_margins if m < 100.0})
+
+                rows = []
+                for m in margins:
+                    price = base_cost / (1.0 - m / 100.0)
+                    profit = price - base_cost
+                    markup = price / base_cost
+                    rows.append(
+                        {
+                            "Margin (%)": m,
+                            base_label: price,
+                            profit_label: profit,
+                            "Markup (× cost)": markup,
+                        }
+                    )
+
+                df_price = pd.DataFrame(rows)
+
+                col_tbl, col_chart = st.columns([1.1, 1.3])
+                with col_tbl:
+                    st.markdown("**Table – Suggested prices by margin**")
+                    st.dataframe(df_price, use_container_width=True)
+                with col_chart:
+                    fig_p, ax_p = plt.subplots(figsize=(6, 4))
+                    ax_p.bar(df_price["Margin (%)"], df_price[base_label])
+                    ax_p.set_xlabel("Margin (%)")
+                    ax_p.set_ylabel(base_label)
+                    ax_p.set_title("Selling price vs. margin")
+                    for i, row in df_price.iterrows():
+                        ax_p.text(
+                            row["Margin (%)"],
+                            row[base_label],
+                            f"{row[base_label]:.2f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=8,
+                        )
+                    fig_p.tight_layout()
+                    st.pyplot(fig_p)
+
+                st.markdown("---")
+                st.subheader("C. User-defined selling price – real margin")
+
+                col_u1, col_u2, col_u3 = st.columns(3)
+                user_price = col_u1.number_input(
+                    base_label,
+                    min_value=0.0,
+                    value=0.0,
+                    help="Type the selling price you plan to charge.",
+                )
+
+                if user_price > 0 and base_cost > 0:
+                    profit_user = user_price - base_cost
+                    margin_user = (profit_user / user_price) * 100.0
+                else:
+                    profit_user = 0.0
+                    margin_user = 0.0
+
+                col_u2.metric(
+                    profit_label,
+                    f"{profit_user:.4f}",
+                )
+                col_u3.metric(
+                    "Real profit margin (%)",
+                    f"{margin_user:.2f}%",
+                )
+
+                st.markdown("**Unit economics – cost vs price vs profit**")
+                fig_u, ax_u = plt.subplots()
+                labels_u = ["Cost per unit", "Selling price", "Profit per unit"]
+                values_u = [
+                    base_cost,
+                    user_price,
+                    profit_user if profit_user > 0 else 0.0,
+                ]
+                ax_u.bar(labels_u, values_u)
+                ax_u.set_ylabel(f"Value ({currency_label()})")
+                ax_u.set_title("Unit economics – selected base unit")
+                for i, v in enumerate(values_u):
+                    ax_u.text(i, v, f"{v:,.4f}", ha="center", va="bottom", fontsize=8)
+                fig_u.tight_layout()
+                st.pyplot(fig_u)
+
+        bottom_nav()
+
+    # ------------------------- TAB: COMPARISON ----------------------------
+    with tab_compare:
+        st.header("5. Comparison – scenario A vs scenario B")
+
+        calc = st.session_state.get("calc")
+        if not calc:
+            st.info("First compute the job cost in **Cost results** to get Scenario A.")
+        else:
+            st.markdown(
+                "Scenario A is the **current job**. You can manually define a Scenario B "
+                "(for another file, different print mode, or future optimisation) using the same units."
+            )
+
+            cost_per_m2_A = calc["cost_per_m2_with_energy"]
+            cost_per_m_A = calc["cost_per_m_with_energy"]
+
+            col_a1, col_a2 = st.columns(2)
+            col_a1.metric(
+                f"Scenario A – cost per m² ({currency_label()})",
+                f"{cost_per_m2_A:.4f}",
+            )
+            col_a2.metric(
+                f"Scenario A – cost per linear metre ({currency_label()})",
+                f"{cost_per_m_A:.4f}",
+            )
+
+            st.markdown("---")
+            st.subheader("Scenario B – manual inputs")
+
+            col_b1, col_b2 = st.columns(2)
+            cost_per_m2_B = col_b1.number_input(
+                f"Scenario B – cost per m² ({currency_label()})",
+                min_value=0.0,
+                value=float(cost_per_m2_A),
+            )
+            cost_per_m_B = col_b2.number_input(
+                f"Scenario B – cost per linear metre ({currency_label()})",
+                min_value=0.0,
+                value=float(cost_per_m_A),
+            )
+
+            st.markdown("### Comparison by unit")
+
+            col_cmp1, col_cmp2 = st.columns(2)
+            with col_cmp1:
+                st.markdown("**Cost per m² – A vs B**")
+                df_cmp_m2 = pd.DataFrame(
+                    {
+                        "Scenario": ["A", "B"],
+                        f"Cost per m² ({currency_label()})": [cost_per_m2_A, cost_per_m2_B],
+                    }
+                )
+                st.dataframe(df_cmp_m2, use_container_width=True)
+
+            with col_cmp2:
+                fig_c1, ax_c1 = plt.subplots(figsize=(5, 3))
+                ax_c1.bar(["A", "B"], [cost_per_m2_A, cost_per_m2_B])
+                ax_c1.set_ylabel(f"Cost per m² ({currency_label()})")
+                ax_c1.set_title("Cost per m² – Scenario A vs B")
+                for i, v in enumerate([cost_per_m2_A, cost_per_m2_B]):
+                    ax_c1.text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+                fig_c1.tight_layout()
+                st.pyplot(fig_c1)
+
+            st.markdown("---")
+            col_cmp3, col_cmp4 = st.columns(2)
+            with col_cmp3:
+                st.markdown("**Cost per linear metre – A vs B**")
+                df_cmp_m = pd.DataFrame(
+                    {
+                        "Scenario": ["A", "B"],
+                        f"Cost per m ({currency_label()})": [cost_per_m_A, cost_per_m_B],
+                    }
+                )
+                st.dataframe(df_cmp_m, use_container_width=True)
+
+            with col_cmp4:
+                fig_c2, ax_c2 = plt.subplots(figsize=(5, 3))
+                ax_c2.bar(["A", "B"], [cost_per_m_A, cost_per_m_B])
+                ax_c2.set_ylabel(f"Cost per m ({currency_label()})")
+                ax_c2.set_title("Cost per linear metre – Scenario A vs B")
+                for i, v in enumerate([cost_per_m_A, cost_per_m_B]):
+                    ax_c2.text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+                fig_c2.tight_layout()
+                st.pyplot(fig_c2)
+
+        bottom_nav()
+
+    # ------------------------- TAB: BREAKDOWN / EFFICIENCY ----------------
+    with tab_break:
+        st.header("6. Breakdown – fixed vs variable & efficiency")
+
+        calc = st.session_state.get("calc")
+        if not calc:
+            st.info("First compute the job cost in **Cost results**.")
+        else:
+            res = calc["res"]
+            cost_energy = calc["cost_energy"]
+            cost_depreciation = calc["cost_depreciation"]
+            total_cost_with_energy = calc["total_cost_with_energy"]
+
+            cost_ink = res["cost_ink"]
+            cost_media = res["cost_media"]
+            cost_other = res["cost_other"]
+            cost_labour = res["cost_labour"]
+
+            variable_cost = cost_ink + cost_media + cost_other + cost_energy + cost_depreciation
+            fixed_cost = cost_labour
+
+            st.subheader("A. Fixed vs variable cost")
+            col_fv1, col_fv2 = st.columns(2)
+            col_fv1.metric(
+                f"Variable costs ({currency_label()})",
+                f"{variable_cost:.2f}",
+                help="Ink, fabric, other variables, energy, depreciation.",
+            )
+            col_fv2.metric(
+                f"Fixed costs ({currency_label()})",
+                f"{fixed_cost:.2f}",
+                help="Labour (all roles).",
+            )
+
+            fig_fv, ax_fv = plt.subplots(figsize=(5, 3))
+            ax_fv.bar(["Variable", "Fixed"], [variable_cost, fixed_cost])
+            ax_fv.set_ylabel(f"Total cost ({currency_label()})")
+            ax_fv.set_title("Fixed vs variable cost")
+            for i, v in enumerate([variable_cost, fixed_cost]):
+                ax_fv.text(i, v, f"{v:,.2f}", ha="center", va="bottom", fontsize=8)
+            fig_fv.tight_layout()
+            st.pyplot(fig_fv)
+
+            st.markdown("---")
+            st.subheader("B. Efficiency & productivity")
+
+            theoretical_time_h = calc["time_total_h"]
+            st.info(
+                "Theoretical Presto machine time is based on print time plus the configured post-process time."
+            )
+
+            col_eff1, col_eff2 = st.columns(2)
+            col_eff1.metric(
+                "Theoretical machine time (h)",
+                f"{theoretical_time_h:.2f}",
+            )
+
+            actual_time_h = col_eff2.number_input(
+                "Actual machine time used in production (h)",
+                min_value=0.0,
+                value=float(theoretical_time_h),
+                key="actual_time_h",
+                help="Real time used, including stops, micro-stops, adjustments, etc.",
+            )
+
+            if actual_time_h > 0:
+                efficiency_pct = theoretical_time_h / actual_time_h * 100.0
+            else:
+                efficiency_pct = 0.0
+
+            length_with_waste = res["length_with_waste"]
+            if theoretical_time_h > 0:
+                productivity_theoretical = length_with_waste / theoretical_time_h
+            else:
+                productivity_theoretical = 0.0
+
+            if actual_time_h > 0:
+                productivity_actual = length_with_waste / actual_time_h
+            else:
+                productivity_actual = 0.0
+
+            col_eff3, col_eff4 = st.columns(2)
+            col_eff3.metric(
+                "Operational efficiency (%)",
+                f"{efficiency_pct:.2f}%",
+                help="Theoretical time / actual time × 100.",
+            )
+            col_eff4.metric(
+                "Actual productivity (m/h)",
+                f"{productivity_actual:.2f}",
+                help="Total length (incl. waste) / actual time.",
+            )
+
+            st.markdown("**Productivity – theoretical vs actual (m/h)**")
+            fig_prod, ax_prod = plt.subplots(figsize=(5, 3))
+            ax_prod.bar(
+                ["Theoretical", "Actual"],
+                [productivity_theoretical, productivity_actual],
+            )
+            ax_prod.set_ylabel("Productivity (m/h)")
+            ax_prod.set_title("Productivity – theoretical vs actual")
+            for i, v in enumerate([productivity_theoretical, productivity_actual]):
+                ax_prod.text(i, v, f"{v:,.2f}", ha="center", va="bottom", fontsize=8)
+            fig_prod.tight_layout()
+            st.pyplot(fig_prod)
+
+        bottom_nav()
+
+
+if __name__ == "__main__":
+    main()
