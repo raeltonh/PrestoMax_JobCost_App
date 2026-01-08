@@ -336,6 +336,18 @@ def parse_controlcenter_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
             "Fixation",
             "Total",
         ]
+        if len(values) >= 9:
+            channels_order = [
+                "Cyan",
+                "Magenta",
+                "Yellow",
+                "Black",
+                "Red",
+                "Green",
+                "Fixation",
+                "White",
+                "Total",
+            ]
 
         for ch, val in zip(channels_order, values):
             if ch == "Total":
@@ -1604,6 +1616,7 @@ def main() -> None:
                                     "Red": "#ef4444",
                                     "Green": "#22c55e",
                                     "Fixation": "#6b7280",
+                                    "White": "#e5e7eb",
                                 }
 
                                 bar_colors = [

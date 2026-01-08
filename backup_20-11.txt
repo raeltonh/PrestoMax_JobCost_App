@@ -2570,5 +2570,84 @@ def main() -> None:
         
         bottom_nav()
 
+    with tab_compare:
+        st.header("8. Job Comparison")
+        st.info("This feature is under development. It will allow you to compare two different job scenarios side-by-side.")
+        bottom_nav()
+
+    with tab_break:
+        st.header("9. Detailed Cost Breakdown")
+        calc = st.session_state.get("calc")
+        if not calc:
+            st.info("First compute the job cost in **Cost results** to see the breakdown.")
+        else:
+            sym = currency_label()
+
+            # --- Labour Breakdown ---
+            st.subheader("Labour Cost Breakdown")
+            labour_breakdown = calc.get("labour_breakdown", [])
+            if labour_breakdown:
+                df_lab = pd.DataFrame(
+                    [
+                        {
+                            "Role": label,
+                            "Cost per Hour": cost_per_h,
+                            "Hours in Job": hours_job,
+                            "Num. People": qty,
+                            f"Total Cost ({sym})": cost_job_total,
+                        }
+                        for label, cost_per_h, hours_job, qty, _, cost_job_total in labour_breakdown
+                    ]
+                )
+                st.dataframe(df_lab, use_container_width=True)
+            else:
+                st.write("No labour costs entered.")
+
+            # --- Other Variables / Services Breakdown ---
+            st.subheader("Other Variable Costs Breakdown")
+            other_costs = {
+                "Laser Cutting (total)": calc.get("laser_total", 0.0),
+                "Internal Sewing": calc.get("sewing_total", 0.0),
+                "Other Simple Variables": calc.get("others_simple_total", 0.0),
+            }
+            df_other = pd.DataFrame(other_costs.items(), columns=["Service", f"Total Cost ({sym})"])
+            st.dataframe(df_other, use_container_width=True)
+
+            # --- Ink Breakdown ---
+            st.subheader("Ink Cost Breakdown")
+            res = calc["res"]
+            area = res.get("area_with_waste", 1.0)
+            if area > 0:
+                rows = []
+                # Color inks
+                color_ml_total = res.get("color_ml_per_m2", 0.0) * area
+                color_cost_total = (color_ml_total / 1000.0) * ink_color_per_l
+                rows.append({"Channel Group": "Color Inks", "ml/m²": res.get("color_ml_per_m2", 0.0), f"Total Cost ({sym})": color_cost_total})
+                # White ink
+                white_ml_total = res.get("white_ml_per_m2", 0.0) * area
+                white_cost_total = (white_ml_total / 1000.0) * ink_white_per_l
+                rows.append({"Channel Group": "White Ink", "ml/m²": res.get("white_ml_per_m2", 0.0), f"Total Cost ({sym})": white_cost_total})
+                # FOF
+                fof_ml_total = res.get("fof_ml_per_m2", 0.0) * area
+                fof_cost_total = (fof_ml_total / 1000.0) * fof_per_l
+                rows.append({"Channel Group": "FOF/Pretreatment", "ml/m²": res.get("fof_ml_per_m2", 0.0), f"Total Cost ({sym})": fof_cost_total})
+                
+                df_ink = pd.DataFrame(rows)
+                st.dataframe(df_ink, use_container_width=True)
+            else:
+                st.write("No ink consumption data available.")
+
+            # --- Depreciation Breakdown ---
+            st.subheader("Depreciation Cost Breakdown")
+            dep_costs = {
+                "Presto MAX Machine": calc.get("cost_depreciation", 0.0),
+                "Laser Machine": calc.get("laser_depreciation_cost", 0.0),
+            }
+            df_dep = pd.DataFrame(dep_costs.items(), columns=["Asset", f"Depreciation Cost for this Job ({sym})"])
+            st.dataframe(df_dep, use_container_width=True)
+
+            bottom_nav()
+
+
 if __name__ == "__main__":
     main()
